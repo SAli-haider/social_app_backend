@@ -1,0 +1,15 @@
+# Dependency folder (MUST be ignored)
+node_modules/
+
+# Lock files (Recommended to KEEP *package-lock.json*, but good to know how to ignore)
+# package-lock.json (Keep this file committed for dependency consistency)
+# npm-debug.log*
+
+# Environment and Secrets
+.env
+.env.local
+
+# Build/Dist/Output folders (your compiled or generated code)
+/dist
+/build
+/out
