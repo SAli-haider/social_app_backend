@@ -46,12 +46,12 @@ export const createConversation = (req, res) => {
 export const getAllConversation = async (req, res) => {
   const userId = req.user.id;
 
-  // Get pagination params (default: page=1, limit=10)
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
   const offset = (page - 1) * limit;
 
-  // Main SQL query with pagination
+  console.log("🟡 Fetching conversations for userId:", userId);
+
   const sql = `
     SELECT
         c.conversation_id,
@@ -61,9 +61,10 @@ export const getAllConversation = async (req, res) => {
         END AS user_id,
         u.user_name AS name,
         u.email AS email,
-        u.profilePic as profilePic,
+        u.profilePic AS profilePic,
         r.chat_id AS last_message_id,
         r.message AS last_message,
+        c.deleted_by_users,
         c.last_activity_at
     FROM 
         Conversations c
@@ -75,42 +76,66 @@ export const getAllConversation = async (req, res) => {
             END
         )
     LEFT JOIN 
-        chatrooms r ON r.chat_id = c.last_message_id AND (deleted_for_all=0 && deleted_by_users IS NULL) AND (deleted_by_users IS NULL OR JSON_CONTAINS(deleted_by_users,?))        
+        chatrooms r 
+        ON r.chat_id = c.last_message_id
+        AND r.deleted_for_all = 0
+        AND (
+            r.deleted_by_users IS NULL 
+            OR NOT JSON_CONTAINS(r.deleted_by_users, CAST(? AS JSON))
+        )
     WHERE 
-        c.user_one_id = ? OR c.user_two_id = ?
+        (c.user_one_id = ? OR c.user_two_id = ?)
+        AND (
+          c.deleted_by_users IS NULL
+          OR NOT JSON_CONTAINS(
+              JSON_EXTRACT(c.deleted_by_users, '$[*].user_id'),
+              CAST(? AS JSON)
+          )
+        )
     ORDER BY 
         c.last_activity_at DESC
     LIMIT ? OFFSET ?;
   `;
 
-  // Count total conversations for pagination info
   const countSql = `
-    SELECT COUNT(*) AS total 
-    FROM Conversations 
-    WHERE user_one_id = ? OR user_two_id = ?;
+    SELECT COUNT(*) AS total
+    FROM Conversations
+    WHERE
+      (user_one_id = ? OR user_two_id = ?)
+      AND (
+        deleted_by_users IS NULL
+        OR NOT JSON_CONTAINS(
+            JSON_EXTRACT(deleted_by_users, '$[*].user_id'),
+            CAST(? AS JSON)
+        )
+      );
   `;
 
+  console.log("🟡 Running query for userId:", userId);
+
   try {
-    // Run both queries
-    db.query(countSql, [userId, userId], (countErr, countResult) => {
+    db.query(countSql, [userId, userId, userId], (countErr, countResult) => {
       if (countErr) {
-        console.error("Error counting conversations:", countErr);
+        console.error("❌ Count query error:", countErr);
         return res.status(500).json({ error: "Failed to count conversations." });
       }
 
       const total = countResult[0].total;
       const totalPages = Math.ceil(total / limit);
 
+      console.log("🟢 Total conversations found:", total);
+
       db.query(
         sql,
-        [userId, userId,JSON.stringify(userId), userId, userId, limit, offset],
+        [userId, userId, userId, userId, userId, userId, limit, offset],
         (error, conversations) => {
           if (error) {
-            console.error("Database error fetching conversations:", error);
-            return res
-              .status(500)
-              .json({ error: "Failed to retrieve conversations." });
+            console.error("❌ Main query error:", error);
+            return res.status(500).json({ error: "Failed to retrieve conversations." });
           }
+
+          console.log("✅ Conversations fetched:", conversations.length);
+          console.log("🧾 Data:", JSON.stringify(conversations, null, 2));
 
           return res.status(200).json({
             page,
@@ -123,10 +148,121 @@ export const getAllConversation = async (req, res) => {
       );
     });
   } catch (err) {
-    console.error("Error in getAllConversation:", err);
+    console.error("🔥 Unexpected error:", err);
     return res.status(500).json({ error: "Unexpected server error." });
   }
 };
+
+export const deleteConversation = (req, res) => {
+  const userId = req.user.id;
+  const { conversation_id } = req.body;
+
+  if (!conversation_id) {
+    return res.status(400).json({ error: "conversation_id is required." });
+  }
+
+  const date = new Date().toISOString();
+
+  // CRITICAL FIX: Use JSON_OBJECT instead of JSON.stringify
+  const sql = `
+    UPDATE conversations
+    SET deleted_by_users = 
+      CASE
+        WHEN deleted_by_users IS NULL 
+        THEN JSON_ARRAY(JSON_OBJECT('user_id', ?, 'deleted_at', ?))
+        
+        WHEN NOT JSON_CONTAINS(
+          JSON_EXTRACT(deleted_by_users, '$[*].user_id'),
+          CAST(? AS JSON)
+        )
+        THEN JSON_ARRAY_APPEND(
+          deleted_by_users, 
+          '$', 
+          JSON_OBJECT('user_id', ?, 'deleted_at', ?)
+        )
+        
+        ELSE deleted_by_users
+      END
+    WHERE conversation_id = ?;
+  `;
+
+  db.query(
+    sql,
+    [userId, date, userId, userId, date, conversation_id],
+    (err, result) => {
+      if (err) {
+        console.error("❌ Error updating conversation:", err);
+        return res.status(500).json({ error: "Failed to soft delete conversation." });
+      }
+
+      console.log("✅ Conversation soft deleted for user:", userId);
+      return res.status(200).json({
+        success: true,
+        message: "Conversation soft deleted for this user.",
+      });
+    }
+  );
+};
+
+export const deleteMessage = (req, res) => {
+  const userId = req.user.id;
+  const { chat_id, delete_for_all } = req.body;
+
+  if (!chat_id) {
+    return res.status(400).json({ error: "chat_id is required." });
+  }
+
+  // If delete for everyone
+  if (delete_for_all === 1) {
+    const sql = `
+      UPDATE chatrooms 
+      SET deleted_for_all = 1 
+      WHERE chat_id = ?;
+    `;
+    
+    db.query(sql, [chat_id], (err) => {
+      if (err) {
+        console.error("❌ Error deleting for everyone:", err);
+        return res.status(500).json({ error: "Failed to delete message for everyone." });
+      }
+      console.log("✅ Message deleted for everyone");
+      return res.status(200).json({ 
+        success: true, 
+        message: "Message deleted for everyone." 
+      });
+    });
+
+  } else {
+    // Delete only for current user - store as simple array [1, 2]
+    const sqlForMe = `
+      UPDATE chatrooms
+      SET deleted_by_users = 
+        CASE 
+          WHEN deleted_by_users IS NULL 
+          THEN JSON_ARRAY(?)
+          
+          WHEN NOT JSON_CONTAINS(deleted_by_users, CAST(? AS JSON)) 
+          THEN JSON_ARRAY_APPEND(deleted_by_users, '$', ?)
+          
+          ELSE deleted_by_users
+        END
+      WHERE chat_id = ?;
+    `;
+
+    db.query(sqlForMe, [userId, userId, userId, chat_id], (err) => {
+      if (err) {
+        console.error("❌ Error deleting for me:", err);
+        return res.status(500).json({ error: "Failed to hide message for you." });
+      }
+      console.log("✅ Message hidden for user:", userId);
+      return res.status(200).json({ 
+        success: true, 
+        message: "Message hidden for you only." 
+      });
+    });
+  }
+};
+
 
 
 export const getAllMessage = (req, res) => {
@@ -249,48 +385,4 @@ export const sendMessage = (req, res) => {
 };
 
 
-export const deleteMessage = (req, res) => {
-  const userId = req.user.id;
-  const { chat_id, delete_for_all } = req.body;
 
-  if (!chat_id) {
-    return res.status(400).json({ error: "chat_id is required." });
-  }
-
-  // If delete for everyone
-  if (delete_for_all === 1 ) {
-    const sql = `
-      UPDATE chatrooms 
-      SET deleted_for_all = 1 
-      WHERE chat_id = ?;
-    `;
-    db.query(sql, [chat_id], (err) => {
-      if (err) {
-        console.error("Error deleting for everyone:", err);
-        return res.status(500).json({ error: "Failed to delete message for everyone." });
-      }
-      return res.status(200).json({ success: true, message: "Message deleted for everyone." });
-    });
-
-  } else {
-    // Otherwise delete only for me
-    const sqlForMe = `
-      UPDATE chatrooms
-      SET deleted_by_users = 
-        CASE 
-          WHEN deleted_by_users IS NULL THEN JSON_ARRAY(?)
-          WHEN NOT JSON_CONTAINS(deleted_by_users, JSON_QUOTE(?)) THEN JSON_ARRAY_APPEND(deleted_by_users, '$', ?)
-          ELSE deleted_by_users
-        END
-      WHERE chat_id = ?;
-    `;
-
-    db.query(sqlForMe, [userId, userId, userId, chat_id], (err) => {
-      if (err) {
-        console.error("Error deleting for me:", err);
-        return res.status(500).json({ error: "Failed to hide message for you." });
-      }
-      return res.status(200).json({ success: true, message: "Message hidden for you only." });
-    });
-  }
-};
