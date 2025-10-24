@@ -1,4 +1,5 @@
 import db from "../db.js"
+import {getIO, getOnlineUsers} from "../utils/socket/chat_socket.js"
 
 export const createConversation = (req, res) => {
   const userId = req.user.id;
@@ -335,7 +336,7 @@ export const sendMessage = (req, res) => {
 
 
 
-  // 1️⃣ Insert the new message
+ 
   const insertMessageSql = `
     INSERT INTO chatrooms (conversation_id, sender_id, message, message_type)
     VALUES (?, ?, ?, ?)
@@ -349,8 +350,12 @@ export const sendMessage = (req, res) => {
 
     const message_id = result.insertId;
 
-    // 2️⃣ Fetch the newly inserted message
+    
     const getMessageSql = `SELECT * FROM chatrooms WHERE chat_id = ?`;
+
+    const io = getIO();
+    const onlineUsers = getOnlineUsers();
+
     db.query(getMessageSql, [message_id], (err, messageResult) => {
       if (err) {
         console.error("Database error fetching message:", err);
@@ -360,12 +365,13 @@ export const sendMessage = (req, res) => {
       const messageData = messageResult[0];
       const lastMessageId = messageData.chat_id;
 
-      // 3️⃣ Update the conversation’s last_message_id and last_activity_at
+      
       const updateConversationSql = `
         UPDATE Conversations
         SET last_message_id = ?, last_activity_at = NOW()
         WHERE conversation_id = ?
       `;
+      
 
       db.query(updateConversationSql, [lastMessageId, conversation_id], (updateErr) => {
         if (updateErr) {
@@ -373,7 +379,23 @@ export const sendMessage = (req, res) => {
           return res.status(500).json({ error: "Failed to update conversation." });
         }
 
-        // 4️⃣ Everything done — send success response
+        const filterOtherUserIdSql = "SELECT * FROM Conversations WHERE conversation_id = ?";
+        db.query(filterOtherUserIdSql, [conversation_id], (filterErr, convResult) => {
+          if (filterErr) {
+            console.error("Database error fetching conversation:", filterErr);
+            return;
+          }
+          const conversation = convResult[0];
+          const otherUserId = (conversation.user_one_id === userId) ? conversation.user_two_id : conversation.user_one_id;
+          const otherUserSocketId = onlineUsers.get(otherUserId);
+
+          if (otherUserSocketId) {  
+            io.to(otherUserSocketId).emit("new_message", messageData);
+            console.log(`🟢 Emitted new_message to user ${otherUserId} on socket ${otherUserSocketId}`);
+          }
+        });
+
+
         return res.status(201).json({
           success: true,
           message: "Message sent successfully.",

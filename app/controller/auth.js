@@ -34,10 +34,13 @@ export const registerUser = async (req, res) => {
 
 
 export const loginUser = (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, device_id, device_name, os } = req.body;
 
   if (!email || !password)
     return res.status(400).json({ error: "Email and password are required" });
+
+  if (!os || !device_id)
+    return res.status(400).json({ error: "Device info required" });
 
   const sql = "SELECT * FROM user WHERE email = ?";
   db.query(sql, [email], async (err, result) => {
@@ -47,13 +50,38 @@ export const loginUser = (req, res) => {
 
     const user = result[0];
     const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(400).json({ error: "Invalid email or password" });
+    if (!match)
+      return res.status(400).json({ error: "Invalid email or password" });
 
-    // generate token (optional)
-    const token = jwt.sign({ id: user.id, email: user.email }, "your_secret_key", {
-      expiresIn: "1h",
-    });
+ 
+    if ((user.device_id === undefined || user.device_id === null) || device_id === user.device_id) {
+      const updateDevice = `
+        UPDATE user 
+        SET device_id = ?, device_name = ?, os = ?, login_date = NOW()
+        WHERE id = ?;
+      `;
+      db.query(updateDevice, [device_id, device_name || null, os, user.id], (err3) => {
+        if (err3) return res.status(500).json({ error: err3.message });
 
-    res.json({ message: "Login successful", token });
+        const token = jwt.sign(
+          { id: user.id, email: user.email },
+          "your_secret_key",
+          { expiresIn: "1h" }
+        );
+
+        return res.json({ message: "Login successful", token });
+      });
+    } else if (user.device_id !== device_id) {
+     
+      return res.status(200).json({
+        message: "Already logged in from another device",
+        loginInfo: {
+          device_id: user.device_id,
+          device_name: user.device_name,
+          os: user.os,
+          login_date: user.login_date,
+        }
+      });
+    }
   });
 };
