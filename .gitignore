@@ -6,10 +6,9 @@ node_modules/
 # npm-debug.log*
 
 # Environment and Secrets
-.env
-.env.local
 
 # Build/Dist/Output folders (your compiled or generated code)
 /dist
 /build
 /out
+config.bat
