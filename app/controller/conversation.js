@@ -51,70 +51,75 @@ export const getAllConversation = async (req, res) => {
   const limit = parseInt(req.query.limit) || 10;
   const offset = (page - 1) * limit;
 
-  console.log("🟡 Fetching conversations for userId:", userId);
-
   const sql = `
     SELECT
-        c.conversation_id,
-        CASE
-            WHEN c.user_one_id = ? THEN c.user_two_id
-            ELSE c.user_one_id
-        END AS user_id,
-        u.user_name AS name,
-        u.email AS email,
-        u.profilePic AS profilePic,
-        r.chat_id AS last_message_id,
-        r.message AS last_message,
-        c.deleted_by_users,
-        c.last_activity_at
-    FROM 
-        Conversations c
-    JOIN 
-        user u ON u.id = (
-            CASE
-                WHEN c.user_one_id = ? THEN c.user_two_id
-                ELSE c.user_one_id
-            END
+      c.conversation_id,
+      CASE WHEN c.user_one_id = ? THEN c.user_two_id ELSE c.user_one_id END AS user_id,
+      u.user_name AS name,
+      u.email AS email,
+      u.profilePic AS profilePic,
+      r.chat_id AS last_message_id,
+      r.message AS last_message,
+      c.last_activity_at
+    FROM Conversations c
+    JOIN user u ON u.id = CASE WHEN c.user_one_id = ? THEN c.user_two_id ELSE c.user_one_id END
+    LEFT JOIN chatrooms r ON r.chat_id = c.last_message_id
+      AND (r.deleted_for_all = 0 OR r.deleted_for_all IS NULL)
+      AND (
+        r.deleted_by_users IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM JSON_TABLE(
+            r.deleted_by_users,
+            '$[*]' COLUMNS(user_id INT PATH '$.user_id')
+          ) AS jt
+          WHERE jt.user_id = ?
         )
-    LEFT JOIN 
-        chatrooms r 
-        ON r.chat_id = c.last_message_id
-        AND r.deleted_for_all = 0
-        AND (
-            r.deleted_by_users IS NULL 
-            OR NOT JSON_CONTAINS(r.deleted_by_users, CAST(? AS JSON))
+      )
+    WHERE (c.user_one_id = ? OR c.user_two_id = ?)
+      AND (
+        c.deleted_by_users IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM JSON_TABLE(
+            c.deleted_by_users,
+            '$[*]' COLUMNS(
+              user_id INT PATH '$.user_id',
+              deleted_at DATETIME PATH '$.deleted_at'
+            )
+          ) AS jt
+          WHERE jt.user_id = ?
+            -- Hide if last_activity_at <= deleted_at (no new activity after deletion)
+            AND c.last_activity_at <= jt.deleted_at
         )
-    WHERE 
-        (c.user_one_id = ? OR c.user_two_id = ?)
-        AND (
-          c.deleted_by_users IS NULL
-          OR NOT JSON_CONTAINS(
-              JSON_EXTRACT(c.deleted_by_users, '$[*].user_id'),
-              CAST(? AS JSON)
-          )
-        )
-    ORDER BY 
-        c.last_activity_at DESC
+      )
+    ORDER BY c.last_activity_at DESC
     LIMIT ? OFFSET ?;
   `;
 
   const countSql = `
     SELECT COUNT(*) AS total
-    FROM Conversations
-    WHERE
-      (user_one_id = ? OR user_two_id = ?)
+    FROM Conversations c
+    WHERE (c.user_one_id = ? OR c.user_two_id = ?)
       AND (
-        deleted_by_users IS NULL
-        OR NOT JSON_CONTAINS(
-            JSON_EXTRACT(deleted_by_users, '$[*].user_id'),
-            CAST(? AS JSON)
+        c.deleted_by_users IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM JSON_TABLE(
+            c.deleted_by_users,
+            '$[*]' COLUMNS(
+              user_id INT PATH '$.user_id',
+              deleted_at DATETIME PATH '$.deleted_at'
+            )
+          ) AS jt
+          WHERE jt.user_id = ?
+            AND c.last_activity_at <= jt.deleted_at
         )
       );
   `;
 
-  console.log("🟡 Running query for userId:", userId);
-
   try {
+    // Get total count for pagination
     db.query(countSql, [userId, userId, userId], (countErr, countResult) => {
       if (countErr) {
         console.error("❌ Count query error:", countErr);
@@ -124,26 +129,23 @@ export const getAllConversation = async (req, res) => {
       const total = countResult[0].total;
       const totalPages = Math.ceil(total / limit);
 
-      console.log("🟢 Total conversations found:", total);
-
+      // Fetch paginated conversations
       db.query(
         sql,
         [userId, userId, userId, userId, userId, userId, limit, offset],
-        (error, conversations) => {
-          if (error) {
-            console.error("❌ Main query error:", error);
+        (err, conversations) => {
+          if (err) {
+            console.error("❌ Main query error:", err);
             return res.status(500).json({ error: "Failed to retrieve conversations." });
           }
 
-          console.log("✅ Conversations fetched:", conversations.length);
-          console.log("🧾 Data:", JSON.stringify(conversations, null, 2));
-
           return res.status(200).json({
+            success: true,
             page,
             limit,
             total,
             totalPages,
-            conversations,
+            conversations
           });
         }
       );
@@ -154,6 +156,7 @@ export const getAllConversation = async (req, res) => {
   }
 };
 
+
 export const deleteConversation = (req, res) => {
   const userId = req.user.id;
   const { conversation_id } = req.body;
@@ -162,16 +165,15 @@ export const deleteConversation = (req, res) => {
     return res.status(400).json({ error: "conversation_id is required." });
   }
 
-  const date = new Date().toISOString();
-
-  // CRITICAL FIX: Use JSON_OBJECT instead of JSON.stringify
   const sql = `
     UPDATE conversations
     SET deleted_by_users = 
       CASE
+        -- If deleted_by_users is NULL, create new array
         WHEN deleted_by_users IS NULL 
-        THEN JSON_ARRAY(JSON_OBJECT('user_id', ?, 'deleted_at', ?))
+        THEN JSON_ARRAY(JSON_OBJECT('user_id', ?, 'deleted_at', NOW()))
         
+        -- If user doesn't exist in array, append new entry
         WHEN NOT JSON_CONTAINS(
           JSON_EXTRACT(deleted_by_users, '$[*].user_id'),
           CAST(? AS JSON)
@@ -179,17 +181,32 @@ export const deleteConversation = (req, res) => {
         THEN JSON_ARRAY_APPEND(
           deleted_by_users, 
           '$', 
-          JSON_OBJECT('user_id', ?, 'deleted_at', ?)
+          JSON_OBJECT('user_id', ?, 'deleted_at', NOW())
         )
         
-        ELSE deleted_by_users
+        -- If user exists, update their deleted_at timestamp
+        ELSE (
+          SELECT JSON_ARRAYAGG(
+            CASE 
+              WHEN JSON_EXTRACT(item, '$.user_id') = ?
+              THEN JSON_OBJECT('user_id', ?, 'deleted_at', NOW())
+              ELSE item
+            END
+          )
+          FROM JSON_TABLE(
+            deleted_by_users,
+            '$[*]' COLUMNS(
+              item JSON PATH '$'
+            )
+          ) AS jt
+        )
       END
     WHERE conversation_id = ?;
   `;
 
   db.query(
     sql,
-    [userId, date, userId, userId, date, conversation_id],
+    [userId, userId, userId, userId, userId, conversation_id],
     (err, result) => {
       if (err) {
         console.error("❌ Error updating conversation:", err);
@@ -274,7 +291,6 @@ export const getAllMessage = (req, res) => {
 
   console.log("Fetching messages for conversationId:", conversationId, "and userId:", userId);
 
-  // ✅ Fixed SQL with proper timezone handling
   const sql = `
     SELECT 
       ch.chat_id,
@@ -287,7 +303,7 @@ export const getAllMessage = (req, res) => {
     LEFT JOIN conversations c 
       ON ch.conversation_id = c.conversation_id
     WHERE ch.conversation_id = ?
-      -- ✅ Compare timestamps properly by converting to UTC
+      -- ✅ Direct comparison - both are in MySQL datetime format
       AND (
         c.deleted_by_users IS NULL 
         OR NOT EXISTS (
@@ -296,33 +312,35 @@ export const getAllMessage = (req, res) => {
             c.deleted_by_users,
             '$[*]' COLUMNS(
               user_id INT PATH '$.user_id',
-              deleted_at VARCHAR(50) PATH '$.deleted_at'
+              deleted_at DATETIME PATH '$.deleted_at'
             )
           ) AS jt
           WHERE jt.user_id = ? 
-            AND CONVERT_TZ(ch.created_at, @@session.time_zone, '+00:00') <= 
-                STR_TO_DATE(
-                  SUBSTRING(jt.deleted_at, 1, 19), 
-                  '%Y-%m-%dT%H:%i:%s'
-                )
+            AND ch.created_at <= jt.deleted_at
         )
       )
       AND (ch.deleted_for_all = 0 OR ch.deleted_for_all IS NULL)
       AND (
         ch.deleted_by_users IS NULL
-        OR JSON_SEARCH(ch.deleted_by_users, 'one', ?, NULL, '$[*].user_id') IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM JSON_TABLE(
+            ch.deleted_by_users,
+            '$[*]' COLUMNS(user_id INT PATH '$.user_id')
+          ) AS jt
+          WHERE jt.user_id = ?
+        )
       )
     ORDER BY ch.created_at DESC
     LIMIT ? OFFSET ?;
   `;
 
-  db.query(sql, [conversationId, userId, userId.toString(), limit, offset], (error, messages) => {
+  db.query(sql, [conversationId, userId, userId, limit, offset], (error, messages) => {
     if (error) {
       console.error("Database error fetching messages:", error);
       return res.status(500).json({ error: "Failed to retrieve messages." });
     }
 
-   
     const countSql = `
       SELECT COUNT(*) AS total 
       FROM chatrooms ch
@@ -337,25 +355,28 @@ export const getAllMessage = (req, res) => {
               c.deleted_by_users,
               '$[*]' COLUMNS(
                 user_id INT PATH '$.user_id',
-                deleted_at VARCHAR(50) PATH '$.deleted_at'
+                deleted_at DATETIME PATH '$.deleted_at'
               )
             ) AS jt
             WHERE jt.user_id = ? 
-              AND CONVERT_TZ(ch.created_at, @@session.time_zone, '+00:00') <= 
-                  STR_TO_DATE(
-                    SUBSTRING(jt.deleted_at, 1, 19), 
-                    '%Y-%m-%dT%H:%i:%s'
-                  )
+              AND ch.created_at <= jt.deleted_at
           )
         )
         AND (ch.deleted_for_all = 0 OR ch.deleted_for_all IS NULL)
         AND (
           ch.deleted_by_users IS NULL
-          OR JSON_SEARCH(ch.deleted_by_users, 'one', ?, NULL, '$[*].user_id') IS NULL
+          OR NOT EXISTS (
+            SELECT 1
+            FROM JSON_TABLE(
+              ch.deleted_by_users,
+              '$[*]' COLUMNS(user_id INT PATH '$.user_id')
+            ) AS jt
+            WHERE jt.user_id = ?
+          )
         );
     `;
 
-    db.query(countSql, [conversationId, userId, userId.toString()], (countErr, countResult) => {
+    db.query(countSql, [conversationId, userId, userId], (countErr, countResult) => {
       if (countErr) {
         console.error("Error counting messages:", countErr);
         return res.status(500).json({ error: "Failed to count messages." });
