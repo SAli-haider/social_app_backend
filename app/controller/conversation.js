@@ -1,5 +1,5 @@
 import db from "../db.js"
-import {getIO, getOnlineUsers} from "../utils/socket/chat_socket.js"
+import { getIO, getOnlineUsers } from "../utils/socket/chat_socket.js"
 
 export const createConversation = (req, res) => {
   const userId = req.user.id;
@@ -220,16 +220,16 @@ export const deleteMessage = (req, res) => {
       SET deleted_for_all = 1 
       WHERE chat_id = ?;
     `;
-    
+
     db.query(sql, [chat_id], (err) => {
       if (err) {
         console.error("❌ Error deleting for everyone:", err);
         return res.status(500).json({ error: "Failed to delete message for everyone." });
       }
       console.log("✅ Message deleted for everyone");
-      return res.status(200).json({ 
-        success: true, 
-        message: "Message deleted for everyone." 
+      return res.status(200).json({
+        success: true,
+        message: "Message deleted for everyone."
       });
     });
 
@@ -256,55 +256,106 @@ export const deleteMessage = (req, res) => {
         return res.status(500).json({ error: "Failed to hide message for you." });
       }
       console.log("✅ Message hidden for user:", userId);
-      return res.status(200).json({ 
-        success: true, 
-        message: "Message hidden for you only." 
+      return res.status(200).json({
+        success: true,
+        message: "Message hidden for you only."
       });
     });
   }
 };
 
-
-
 export const getAllMessage = (req, res) => {
-  const userId = req.user.id; // numeric userId
-  const conversation_id = req.query.conversation_id;
+  const userId = req.user.id;
+  const conversationId = req.query.conversation_id;
 
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
   const offset = (page - 1) * limit;
 
+  console.log("Fetching messages for conversationId:", conversationId, "and userId:", userId);
+
+  // ✅ Fixed SQL with proper timezone handling
   const sql = `
-    SELECT chat_id, conversation_id, message, message_type, sender_id, created_at 
-    FROM chatrooms
-    WHERE conversation_id = ? 
-      AND (deleted_for_all = 0 OR deleted_for_all IS NULL)
+    SELECT 
+      ch.chat_id,
+      ch.conversation_id,
+      ch.message,
+      ch.message_type,
+      ch.sender_id,
+      ch.created_at
+    FROM chatrooms ch
+    LEFT JOIN conversations c 
+      ON ch.conversation_id = c.conversation_id
+    WHERE ch.conversation_id = ?
+      -- ✅ Compare timestamps properly by converting to UTC
       AND (
-        deleted_by_users IS NULL 
-        OR NOT JSON_CONTAINS(deleted_by_users, ?)
+        c.deleted_by_users IS NULL 
+        OR NOT EXISTS (
+          SELECT 1 
+          FROM JSON_TABLE(
+            c.deleted_by_users,
+            '$[*]' COLUMNS(
+              user_id INT PATH '$.user_id',
+              deleted_at VARCHAR(50) PATH '$.deleted_at'
+            )
+          ) AS jt
+          WHERE jt.user_id = ? 
+            AND CONVERT_TZ(ch.created_at, @@session.time_zone, '+00:00') <= 
+                STR_TO_DATE(
+                  SUBSTRING(jt.deleted_at, 1, 19), 
+                  '%Y-%m-%dT%H:%i:%s'
+                )
+        )
       )
-    ORDER BY created_at DESC
+      AND (ch.deleted_for_all = 0 OR ch.deleted_for_all IS NULL)
+      AND (
+        ch.deleted_by_users IS NULL
+        OR JSON_SEARCH(ch.deleted_by_users, 'one', ?, NULL, '$[*].user_id') IS NULL
+      )
+    ORDER BY ch.created_at DESC
     LIMIT ? OFFSET ?;
   `;
 
-  db.query(sql, [conversation_id, JSON.stringify(userId), limit, offset], (error, messages) => {
+  db.query(sql, [conversationId, userId, userId.toString(), limit, offset], (error, messages) => {
     if (error) {
       console.error("Database error fetching messages:", error);
       return res.status(500).json({ error: "Failed to retrieve messages." });
     }
 
+   
     const countSql = `
       SELECT COUNT(*) AS total 
-      FROM chatrooms 
-      WHERE conversation_id = ?
-        AND (deleted_for_all = 0 OR deleted_for_all IS NULL)
+      FROM chatrooms ch
+      LEFT JOIN conversations c 
+        ON ch.conversation_id = c.conversation_id
+      WHERE ch.conversation_id = ?
         AND (
-          deleted_by_users IS NULL 
-          OR NOT JSON_CONTAINS(deleted_by_users, ?)
+          c.deleted_by_users IS NULL 
+          OR NOT EXISTS (
+            SELECT 1 
+            FROM JSON_TABLE(
+              c.deleted_by_users,
+              '$[*]' COLUMNS(
+                user_id INT PATH '$.user_id',
+                deleted_at VARCHAR(50) PATH '$.deleted_at'
+              )
+            ) AS jt
+            WHERE jt.user_id = ? 
+              AND CONVERT_TZ(ch.created_at, @@session.time_zone, '+00:00') <= 
+                  STR_TO_DATE(
+                    SUBSTRING(jt.deleted_at, 1, 19), 
+                    '%Y-%m-%dT%H:%i:%s'
+                  )
+          )
+        )
+        AND (ch.deleted_for_all = 0 OR ch.deleted_for_all IS NULL)
+        AND (
+          ch.deleted_by_users IS NULL
+          OR JSON_SEARCH(ch.deleted_by_users, 'one', ?, NULL, '$[*].user_id') IS NULL
         );
     `;
 
-    db.query(countSql, [conversation_id, JSON.stringify(userId)], (countErr, countResult) => {
+    db.query(countSql, [conversationId, userId, userId.toString()], (countErr, countResult) => {
       if (countErr) {
         console.error("Error counting messages:", countErr);
         return res.status(500).json({ error: "Failed to count messages." });
@@ -324,19 +375,120 @@ export const getAllMessage = (req, res) => {
     });
   });
 };
+// export const getAllMessage = (req, res) => {
+//   const userId = req.user.id; // numeric userId
+//   const conversationId = req.query.conversation_id;
+
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 10;
+//   const offset = (page - 1) * limit;
+
+//   console.log(" Fetching messages for conversationId:", conversationId, "and userId:", userId);
+
+//   const checkDeletedSql = `
+//     SELECT * from chatrooms ch join conversations c
+//     ON ch.conversation_id = c.conversation_id
+//     WHERE c.deleted_by_users IS NOT NULL and json_contains(
+//       json_extract(c.deleted_by_users, '$[*].user_id'),
+//       CAST(? AS JSON)
+//     )  AND ch.conversation_id = ?;
+//   `;
+
+//   db.query(checkDeletedSql, [userId, conversationId], (checkErr, checkResult) => {
+//     if (checkErr) {
+//       console.error("❌ Error checking deleted conversation:", checkErr);
+//       return res.status(500).json({ error: "Failed to check conversation status." });
+//     }
+//     if (checkResult.length > 0) {
+//       console.log("⚠️ Conversation has been deleted for user:", userId);
+//       return res.status(200).json({
+//         success: true,
+//         page,
+//         limit,
+//           total: 0,
+//         totalPages: 0,
+//         messages:[],
+//       });
+  
+//       return res.status(403).json({ error: "This conversation has been deleted for you." });
+//     }
+//     // ✅ Correct SQL
+//   const sql = `
+//     SELECT 
+//       ch.chat_id,
+//       ch.conversation_id,
+//       ch.message,
+//       ch.message_type,
+//       ch.sender_id,
+//       ch.created_at
+//     FROM chatrooms ch
+//     JOIN conversations c 
+//       ON ch.conversation_id = c.conversation_id
+//     WHERE ch.conversation_id = ?
+//       AND (ch.deleted_for_all = 0 OR ch.deleted_for_all IS NULL)
+//       AND (
+//         ch.deleted_by_users IS NULL
+//         OR JSON_SEARCH(ch.deleted_by_users, 'one', ?, NULL, '$[*].user_id') IS NULL
+//       )
+//     ORDER BY ch.created_at DESC
+//     LIMIT ? OFFSET ?;
+//   `;
+
+//   db.query(sql, [conversationId, userId.toString(), limit, offset], (error, messages) => {
+//     if (error) {
+//       console.error("Database error fetching messages:", error);
+//       return res.status(500).json({ error: "Failed to retrieve messages." });
+//     }
+
+//     // ✅ Count total messages for pagination
+//     const countSql = `
+//       SELECT COUNT(*) AS total 
+//       FROM chatrooms ch
+//       WHERE ch.conversation_id = ?
+//         AND (ch.deleted_for_all = 0 OR ch.deleted_for_all IS NULL)
+//         AND (
+//           ch.deleted_by_users IS NULL
+//           OR JSON_SEARCH(ch.deleted_by_users, 'one', ?, NULL, '$[*].user_id') IS NULL
+//         );
+//     `;
+
+//     db.query(countSql, [conversationId, userId.toString()], (countErr, countResult) => {
+//       if (countErr) {
+//         console.error("Error counting messages:", countErr);
+//         return res.status(500).json({ error: "Failed to count messages." });
+//       }
+
+//       const total = countResult[0].total;
+//       const totalPages = Math.ceil(total / limit);
+
+//       return res.status(200).json({
+//         success: true,
+//         page,
+//         limit,
+//         total,
+//         totalPages,
+//         messages,
+//       });
+//     });
+//   });
+//   });
+
+  
+// };
+
 
 export const sendMessage = (req, res) => {
   const userId = req.user.id;
   const { conversation_id, message, message_type } = req.body;
 
 
-  if (!conversation_id || !message ) {
+  if (!conversation_id || !message) {
     return res.status(400).json({ error: "Missing required fields." });
   }
 
 
 
- 
+
   const insertMessageSql = `
     INSERT INTO chatrooms (conversation_id, sender_id, message, message_type)
     VALUES (?, ?, ?, ?)
@@ -350,7 +502,7 @@ export const sendMessage = (req, res) => {
 
     const message_id = result.insertId;
 
-    
+
     const getMessageSql = `SELECT * FROM chatrooms WHERE chat_id = ?`;
 
     const io = getIO();
@@ -365,13 +517,13 @@ export const sendMessage = (req, res) => {
       const messageData = messageResult[0];
       const lastMessageId = messageData.chat_id;
 
-      
+
       const updateConversationSql = `
         UPDATE Conversations
         SET last_message_id = ?, last_activity_at = NOW()
         WHERE conversation_id = ?
       `;
-      
+
 
       db.query(updateConversationSql, [lastMessageId, conversation_id], (updateErr) => {
         if (updateErr) {
@@ -389,7 +541,7 @@ export const sendMessage = (req, res) => {
           const otherUserId = (conversation.user_one_id === userId) ? conversation.user_two_id : conversation.user_one_id;
           const otherUserSocketId = onlineUsers.get(otherUserId);
 
-          if (otherUserSocketId) {  
+          if (otherUserSocketId) {
             io.to(otherUserSocketId).emit("new_message", messageData);
             console.log(`🟢 Emitted new_message to user ${otherUserId} on socket ${otherUserSocketId}`);
           }
